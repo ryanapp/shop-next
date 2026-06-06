@@ -34,6 +34,7 @@ export type TestRunResult = {
 
 export type GenerateRuleOptions = {
   prisma?: PrismaClient;
+  slug?: string;
   createSources?: (input: {
     prompt: string;
     slug: string;
@@ -65,7 +66,7 @@ export async function generateDiscountRule(
   }
 
   const prisma = options.prisma ?? defaultPrisma;
-  const slug = slugify(trimmedPrompt);
+  const slug = options.slug ?? slugify(trimmedPrompt);
   const version = await nextVersionForSlug(prisma, slug);
   const modulePath = `${generatedDirectory}/${slug}.v${version}.ts`;
   const testPath = `${generatedDirectory}/${slug}.v${version}.test.ts`;
@@ -134,13 +135,33 @@ export async function generateDiscountRule(
     const status =
       testResults.exitCode === 0 ? RULE_STATUSES.ACTIVE : RULE_STATUSES.FAILED;
 
-    await prisma.rule.update({
-      where: { id: rule.id },
-      data: {
-        status,
-        testResults: serializedResults
-      }
-    });
+    if (status === RULE_STATUSES.ACTIVE) {
+      await prisma.$transaction([
+        prisma.rule.updateMany({
+          where: {
+            slug,
+            id: { not: rule.id },
+            status: RULE_STATUSES.ACTIVE
+          },
+          data: { status: RULE_STATUSES.DISABLED }
+        }),
+        prisma.rule.update({
+          where: { id: rule.id },
+          data: {
+            status,
+            testResults: serializedResults
+          }
+        })
+      ]);
+    } else {
+      await prisma.rule.update({
+        where: { id: rule.id },
+        data: {
+          status,
+          testResults: serializedResults
+        }
+      });
+    }
 
     return {
       id: rule.id,

@@ -81,6 +81,8 @@ At minimum, rule lifecycle mutations revalidate:
 
 Checkout must continue to calculate totals through the same active-rule pricing path used by the cart page.
 
+The generation pipeline from spec 04 is also part of lifecycle semantics: whenever a newly generated or edited rule becomes `ACTIVE`, it must atomically disable other active versions in the same slug family. Failed generations and failed edits must not change the currently active version.
+
 ## Admin UI
 
 The rule console supports:

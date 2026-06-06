@@ -485,6 +485,16 @@ button:disabled:hover {
   padding: 10px 12px;
 }
 
+.form-note {
+  background: rgba(15, 106, 115, 0.1);
+  border: 1px solid rgba(15, 106, 115, 0.22);
+  border-radius: 6px;
+  color: var(--accent-strong);
+  font-weight: 700;
+  margin: 0;
+  padding: 10px 12px;
+}
+
 .rule-console {
   display: grid;
   gap: 16px;
@@ -537,6 +547,17 @@ button:disabled:hover {
   font-size: 12px;
   font-weight: 800;
   padding: 4px 8px;
+}
+
+.rule-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.rule-actions button {
+  min-height: 34px;
+  padding: 0 10px;
 }
 
 @media (max-width: 820px) {

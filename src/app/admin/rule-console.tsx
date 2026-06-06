@@ -21,6 +21,7 @@ type GenerationResult = {
 
 export function RuleConsole() {
   const [prompt, setPrompt] = useState("");
+  const [editingRule, setEditingRule] = useState<RuleHistoryItem | null>(null);
   const [rules, setRules] = useState<RuleHistoryItem[]>([]);
   const [latestResult, setLatestResult] = useState<GenerationResult | null>(
     null
@@ -49,7 +50,10 @@ export function RuleConsole() {
     setLatestResult(null);
 
     startTransition(async () => {
-      const response = await fetch("/api/rules", {
+      const endpoint = editingRule
+        ? `/api/rules/${editingRule.id}/edit`
+        : "/api/rules";
+      const response = await fetch(endpoint, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ prompt })
@@ -66,6 +70,34 @@ export function RuleConsole() {
 
       setLatestResult(data);
       setPrompt("");
+      setEditingRule(null);
+      await loadRules();
+    });
+  }
+
+  function runLifecycleAction(rule: RuleHistoryItem, action: string) {
+    setError(null);
+    setLatestResult(null);
+
+    startTransition(async () => {
+      const response = await fetch(`/api/rules/${rule.id}/${action}`, {
+        method: "POST"
+      });
+      const data = (await response.json()) as
+        | { rule: RuleHistoryItem }
+        | { error: string };
+
+      if (!response.ok || "error" in data) {
+        setError("error" in data ? data.error : `${action} failed.`);
+        return;
+      }
+
+      setLatestResult({
+        id: data.rule.id,
+        status: data.rule.status,
+        accepted: data.rule.status === "ACTIVE",
+        testResults: `${action} completed for v${data.rule.version}.`
+      });
       await loadRules();
     });
   }
@@ -90,9 +122,27 @@ export function RuleConsole() {
           />
         </label>
         {error ? <p className="form-error">{error}</p> : null}
+        {editingRule ? (
+          <p className="form-note">Editing v{editingRule.version} as a new version.</p>
+        ) : null}
         <button disabled={isPending || prompt.trim() === ""} type="submit">
-          {isPending ? "Generating..." : "Generate rule"}
+          {isPending
+            ? "Working..."
+            : editingRule
+              ? "Generate edited version"
+              : "Generate rule"}
         </button>
+        {editingRule ? (
+          <button
+            onClick={() => {
+              setEditingRule(null);
+              setPrompt("");
+            }}
+            type="button"
+          >
+            Cancel edit
+          </button>
+        ) : null}
       </form>
 
       {latestResult ? (
@@ -116,6 +166,7 @@ export function RuleConsole() {
                 <th>Prompt</th>
                 <th>Version</th>
                 <th>Status</th>
+                <th>Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -125,6 +176,45 @@ export function RuleConsole() {
                   <td>v{rule.version}</td>
                   <td>
                     <span className="status-label">{rule.status}</span>
+                  </td>
+                  <td>
+                    <div className="rule-actions">
+                      {rule.status === "ACTIVE" ? (
+                        <button
+                          disabled={isPending}
+                          onClick={() => runLifecycleAction(rule, "disable")}
+                          type="button"
+                        >
+                          Disable
+                        </button>
+                      ) : null}
+                      {rule.status === "DISABLED" ? (
+                        <button
+                          disabled={isPending}
+                          onClick={() => runLifecycleAction(rule, "activate")}
+                          type="button"
+                        >
+                          Enable
+                        </button>
+                      ) : null}
+                      <button
+                        disabled={isPending}
+                        onClick={() => {
+                          setEditingRule(rule);
+                          setPrompt(rule.source);
+                        }}
+                        type="button"
+                      >
+                        Edit
+                      </button>
+                      <button
+                        disabled={isPending}
+                        onClick={() => runLifecycleAction(rule, "delete")}
+                        type="button"
+                      >
+                        Delete
+                      </button>
+                    </div>
                   </td>
                 </tr>
               ))}
