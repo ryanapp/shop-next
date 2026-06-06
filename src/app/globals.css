@@ -406,9 +406,11 @@ button:disabled:hover {
 }
 
 .auth-layout {
+  align-items: start;
   display: grid;
-  gap: 24px;
-  grid-template-columns: minmax(0, 0.9fr) minmax(320px, 0.7fr);
+  gap: 36px;
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 0.74fr);
+  padding-top: 28px;
 }
 
 .admin-shell {
@@ -425,12 +427,21 @@ button:disabled:hover {
   margin: 0;
 }
 
-.auth-layout > div,
 .admin-heading {
   align-items: flex-end;
   display: flex;
   gap: 14px;
   justify-content: space-between;
+}
+
+.auth-layout > div {
+  display: grid;
+  gap: 12px;
+  max-width: 560px;
+}
+
+.auth-layout > div .section-kicker {
+  margin: 0;
 }
 
 .auth-layout p,
@@ -774,6 +785,10 @@ button:disabled:hover {
     border-right: 0;
     padding-bottom: 18px;
     padding-right: 0;
+  }
+
+  .auth-layout {
+    padding-top: 0;
   }
 
   .cart-summary {
