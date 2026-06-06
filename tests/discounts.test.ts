@@ -9,6 +9,7 @@ import { cartSummaryToDiscountCart } from "../src/lib/discounts/adapter";
 import {
   createCodexChildEnv,
   generateDiscountRule,
+  sanitizeCodexChildPath,
   validateGeneratedModuleSource,
   validateGeneratedTestSource,
   type GeneratedRuleSources
@@ -155,6 +156,19 @@ describe("Codex SDK runtime environment", () => {
     expect(env.CODEX_SANDBOX).toBeUndefined();
     expect(env.CODEX_THREAD_ID).toBeUndefined();
     expect(env.AUTH_SECRET).toBe("test-secret");
+  });
+
+  it("removes Codex sandbox path shims from the child generator PATH", () => {
+    const sanitized = sanitizeCodexChildPath(
+      [
+        "/Users/ryan/.codex/tmp/arg0/codex-arg0abc",
+        "/usr/local/bin",
+        "/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin",
+        "/usr/bin"
+      ].join(":")
+    );
+
+    expect(sanitized).toBe("/usr/local/bin:/usr/bin");
   });
 });
 

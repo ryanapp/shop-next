@@ -504,10 +504,24 @@ export function createCodexChildEnv(): Record<string, string> {
       continue;
     }
 
-    env[key] = value;
+    env[key] = key === "PATH" ? sanitizeCodexChildPath(value) : value;
   }
 
   return env;
+}
+
+export function sanitizeCodexChildPath(value: string): string {
+  const entries = value
+    .split(path.delimiter)
+    .filter((entry) => entry.length > 0)
+    .filter((entry) => !entry.includes(`${path.sep}.codex${path.sep}tmp${path.sep}arg0`))
+    .filter((entry) => !entry.includes(`${path.sep}codex.system${path.sep}`));
+
+  if (entries.length > 0) {
+    return entries.join(path.delimiter);
+  }
+
+  return ["/usr/local/bin", "/usr/bin", "/bin"].join(path.delimiter);
 }
 
 async function runVitestForGeneratedRule(
