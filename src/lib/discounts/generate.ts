@@ -24,6 +24,32 @@ export type RuleGenerationResult = {
   testResults: string;
 };
 
+export type GenerationEvent =
+  | {
+      type: "phase";
+      phase:
+        | "GENERATING"
+        | "POLICY_REVIEW"
+        | "SOURCE_REVIEW"
+        | "TESTING"
+        | "ACTIVATING"
+        | "ACTIVE"
+        | "FAILED";
+      message: string;
+    }
+  | {
+      type: "codex";
+      text: string;
+    }
+  | {
+      type: "generatedTestResults";
+      results: TestRunResult;
+    }
+  | {
+      type: "result";
+      result: RuleGenerationResult;
+    };
+
 export type TestRunResult = {
   command: string;
   exitCode: number;
@@ -41,8 +67,10 @@ export type GenerateRuleOptions = {
     version: number;
     modulePath: string;
     testPath: string;
+    onCodexOutput?: (text: string) => void;
   }) => Promise<GeneratedRuleSources>;
   runTests?: (testPath: string) => Promise<TestRunResult>;
+  onEvent?: (event: GenerationEvent) => void;
 };
 
 const generatedOutputSchema = {
@@ -66,6 +94,7 @@ export async function generateDiscountRule(
   }
 
   const prisma = options.prisma ?? defaultPrisma;
+  const emit = options.onEvent ?? (() => undefined);
   const slug = options.slug ?? slugify(trimmedPrompt);
   const version = await nextVersionForSlug(prisma, slug);
   const modulePath = `${generatedDirectory}/${slug}.v${version}.ts`;
@@ -83,29 +112,49 @@ export async function generateDiscountRule(
   });
 
   try {
+    emit({
+      type: "phase",
+      phase: "POLICY_REVIEW",
+      message: "Reviewing merchant prompt against discount policy."
+    });
     const promptReview = await reviewDiscountPolicy(trimmedPrompt);
 
     if (!promptReview.accepted) {
-      return await failRule(prisma, rule.id, promptReview.reason);
+      const result = await failRule(prisma, rule.id, promptReview.reason);
+      emit({ type: "result", result });
+      return result;
     }
 
+    emit({
+      type: "phase",
+      phase: "GENERATING",
+      message: "Generating discount module and Vitest spec with Codex."
+    });
     const createSources = options.createSources ?? createSourcesWithCodex;
     const generated = await createSources({
       prompt: trimmedPrompt,
       slug,
       version,
       modulePath,
-      testPath
+      testPath,
+      onCodexOutput: (text) => emit({ type: "codex", text })
     });
 
     validateGeneratedModuleSource(generated.moduleCode);
 
+    emit({
+      type: "phase",
+      phase: "SOURCE_REVIEW",
+      message: "Validating generated source and reviewing it against policy."
+    });
     const sourceReview = await reviewDiscountPolicy(
       `${trimmedPrompt}\n\n${generated.moduleCode}\n\n${generated.testCode}`
     );
 
     if (!sourceReview.accepted) {
-      return await failRule(prisma, rule.id, sourceReview.reason);
+      const result = await failRule(prisma, rule.id, sourceReview.reason);
+      emit({ type: "result", result });
+      return result;
     }
 
     const augmentedTestCode = appendSystemSafetyTest(
@@ -129,13 +178,24 @@ export async function generateDiscountRule(
     });
 
     const runTests = options.runTests ?? runVitestForGeneratedRule;
+    emit({
+      type: "phase",
+      phase: "TESTING",
+      message: "Running generated Vitest spec and system-owned safety tests."
+    });
     const testResults = await runTests(testPath);
+    emit({ type: "generatedTestResults", results: testResults });
     const serializedResults = JSON.stringify(testResults, null, 2);
 
     const status =
       testResults.exitCode === 0 ? RULE_STATUSES.ACTIVE : RULE_STATUSES.FAILED;
 
     if (status === RULE_STATUSES.ACTIVE) {
+      emit({
+        type: "phase",
+        phase: "ACTIVATING",
+        message: "Activating verified rule and disabling older active versions."
+      });
       await prisma.$transaction([
         prisma.rule.updateMany({
           where: {
@@ -163,18 +223,29 @@ export async function generateDiscountRule(
       });
     }
 
-    return {
+    const result = {
       id: rule.id,
       status,
       accepted: status === RULE_STATUSES.ACTIVE,
       testResults: serializedResults
     };
+    emit({
+      type: "phase",
+      phase: result.accepted ? "ACTIVE" : "FAILED",
+      message: result.accepted
+        ? "Generated rule passed verification and is active."
+        : "Generated rule failed verification."
+    });
+    emit({ type: "result", result });
+    return result;
   } catch (error) {
-    return await failRule(
+    const result = await failRule(
       prisma,
       rule.id,
       error instanceof Error ? error.message : "Rule generation failed."
     );
+    emit({ type: "result", result });
+    return result;
   }
 }
 
@@ -288,6 +359,7 @@ async function createSourcesWithCodex(input: {
   version: number;
   modulePath: string;
   testPath: string;
+  onCodexOutput?: (text: string) => void;
 }): Promise<GeneratedRuleSources> {
   const [skill, policy] = await Promise.all([
     readFile(path.join(process.cwd(), skillPath), "utf8"),
@@ -304,8 +376,7 @@ async function createSourcesWithCodex(input: {
     networkAccessEnabled: false
   });
 
-  const turn = await thread.run(
-    `Generate a discount module and Vitest spec as JSON only.
+  const prompt = `Generate a discount module and Vitest spec as JSON only.
 
 Merchant promotion:
 ${input.prompt}
@@ -324,11 +395,31 @@ Return JSON with exactly:
 - moduleCode: TypeScript source for ${input.modulePath}
 - testCode: Vitest source for ${input.testPath}
 
-Do not write files. Do not include markdown fences.`,
-    { outputSchema: generatedOutputSchema }
-  );
+Do not write files. Do not include markdown fences.`;
 
-  const parsed = JSON.parse(turn.finalResponse) as Partial<GeneratedRuleSources>;
+  const { events } = await thread.runStreamed(prompt, {
+    outputSchema: generatedOutputSchema
+  });
+  let finalResponse = "";
+
+  for await (const event of events) {
+    if (event.type !== "item.completed") {
+      continue;
+    }
+
+    if (event.item.type === "agent_message") {
+      finalResponse = event.item.text;
+      input.onCodexOutput?.(event.item.text);
+    } else if (event.item.type === "reasoning") {
+      input.onCodexOutput?.(event.item.text);
+    } else if (event.item.type === "error") {
+      input.onCodexOutput?.(event.item.message);
+    } else if (event.item.type === "command_execution") {
+      input.onCodexOutput?.(event.item.aggregated_output);
+    }
+  }
+
+  const parsed = JSON.parse(finalResponse) as Partial<GeneratedRuleSources>;
 
   if (typeof parsed.moduleCode !== "string" || typeof parsed.testCode !== "string") {
     throw new Error("Codex did not return generated module and test source.");

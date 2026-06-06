@@ -14,7 +14,14 @@ export async function POST(_request: Request, context: RouteContext) {
   }
 
   const { id } = await context.params;
-  const rule = await deleteRule(id);
 
-  return NextResponse.json({ rule });
+  try {
+    const rule = await deleteRule(id);
+    return NextResponse.json({ rule });
+  } catch (error) {
+    return NextResponse.json(
+      { error: error instanceof Error ? error.message : "Delete failed." },
+      { status: 400 }
+    );
+  }
 }
