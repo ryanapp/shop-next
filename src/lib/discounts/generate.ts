@@ -1,10 +1,21 @@
 import { execFile } from "node:child_process";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import {
+  cp,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  writeFile
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { Codex } from "@openai/codex-sdk";
 import type { PrismaClient } from "@prisma/client";
+import ts from "typescript";
 import { prisma as defaultPrisma } from "../db";
+import { runBuiltInAppTests } from "../verification/app-tests";
 import { RULE_STATUSES } from "./status";
 
 const execFileAsync = promisify(execFile);
@@ -24,6 +35,19 @@ export type RuleGenerationResult = {
   testResults: string;
 };
 
+export type TestRunResult = {
+  command: string;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  durationMs: number;
+};
+
+type VerificationResults = {
+  generated?: TestRunResult;
+  app?: TestRunResult;
+};
+
 export type GenerationEvent =
   | {
       type: "phase";
@@ -32,6 +56,7 @@ export type GenerationEvent =
         | "POLICY_REVIEW"
         | "SOURCE_REVIEW"
         | "TESTING"
+        | "APP_TESTING"
         | "ACTIVATING"
         | "ACTIVE"
         | "FAILED";
@@ -46,17 +71,15 @@ export type GenerationEvent =
       results: TestRunResult;
     }
   | {
+      type: "appTestStatus";
+      status: "RUNNING" | "PASSED" | "FAILED";
+      message: string;
+      results?: TestRunResult;
+    }
+  | {
       type: "result";
       result: RuleGenerationResult;
     };
-
-export type TestRunResult = {
-  command: string;
-  exitCode: number;
-  stdout: string;
-  stderr: string;
-  durationMs: number;
-};
 
 export type GenerateRuleOptions = {
   prisma?: PrismaClient;
@@ -70,6 +93,7 @@ export type GenerateRuleOptions = {
     onCodexOutput?: (text: string) => void;
   }) => Promise<GeneratedRuleSources>;
   runTests?: (testPath: string) => Promise<TestRunResult>;
+  runAppTests?: () => Promise<TestRunResult>;
   onEvent?: (event: GenerationEvent) => void;
 };
 
@@ -96,20 +120,11 @@ export async function generateDiscountRule(
   const prisma = options.prisma ?? defaultPrisma;
   const emit = options.onEvent ?? (() => undefined);
   const slug = options.slug ?? slugify(trimmedPrompt);
-  const version = await nextVersionForSlug(prisma, slug);
-  const modulePath = `${generatedDirectory}/${slug}.v${version}.ts`;
-  const testPath = `${generatedDirectory}/${slug}.v${version}.test.ts`;
-
-  const rule = await prisma.rule.create({
-    data: {
-      source: trimmedPrompt,
-      slug,
-      version,
-      status: RULE_STATUSES.GENERATING,
-      modulePath,
-      testPath
-    }
-  });
+  const { rule, version, modulePath, testPath } = await createGeneratingRule(
+    prisma,
+    slug,
+    trimmedPrompt
+  );
 
   try {
     emit({
@@ -157,10 +172,12 @@ export async function generateDiscountRule(
       return result;
     }
 
+    const moduleImportPath = `./${slug}.v${version}`;
     const augmentedTestCode = appendSystemSafetyTest(
       generated.testCode,
-      `./${slug}.v${version}`
+      moduleImportPath
     );
+    validateGeneratedTestSource(augmentedTestCode, moduleImportPath);
 
     await mkdir(path.join(process.cwd(), generatedDirectory), {
       recursive: true
@@ -183,58 +200,83 @@ export async function generateDiscountRule(
       phase: "TESTING",
       message: "Running generated Vitest spec and system-owned safety tests."
     });
-    const testResults = await runTests(testPath);
-    emit({ type: "generatedTestResults", results: testResults });
-    const serializedResults = JSON.stringify(testResults, null, 2);
+    const generatedTestResults = await runTests(testPath);
+    emit({ type: "generatedTestResults", results: generatedTestResults });
 
-    const status =
-      testResults.exitCode === 0 ? RULE_STATUSES.ACTIVE : RULE_STATUSES.FAILED;
-
-    if (status === RULE_STATUSES.ACTIVE) {
-      emit({
-        type: "phase",
-        phase: "ACTIVATING",
-        message: "Activating verified rule and disabling older active versions."
-      });
-      await prisma.$transaction([
-        prisma.rule.updateMany({
-          where: {
-            slug,
-            id: { not: rule.id },
-            status: RULE_STATUSES.ACTIVE
-          },
-          data: { status: RULE_STATUSES.DISABLED }
-        }),
-        prisma.rule.update({
-          where: { id: rule.id },
-          data: {
-            status,
-            testResults: serializedResults
-          }
-        })
-      ]);
-    } else {
-      await prisma.rule.update({
-        where: { id: rule.id },
-        data: {
-          status,
-          testResults: serializedResults
-        }
+    if (generatedTestResults.exitCode !== 0) {
+      return await failVerifiedRule(prisma, rule.id, emit, {
+        generated: generatedTestResults
       });
     }
 
+    emit({
+      type: "phase",
+      phase: "APP_TESTING",
+      message: "Running built-in app test suite before activation."
+    });
+    emit({
+      type: "appTestStatus",
+      status: "RUNNING",
+      message: "Running built-in app test suite."
+    });
+    const runAppTests = options.runAppTests ?? runBuiltInAppTests;
+    const appTestResults = await runAppTests();
+    emit({
+      type: "appTestStatus",
+      status: appTestResults.exitCode === 0 ? "PASSED" : "FAILED",
+      message:
+        appTestResults.exitCode === 0
+          ? "Built-in app tests passed."
+          : "Built-in app tests failed.",
+      results: appTestResults
+    });
+
+    if (appTestResults.exitCode !== 0) {
+      return await failVerifiedRule(prisma, rule.id, emit, {
+        generated: generatedTestResults,
+        app: appTestResults
+      });
+    }
+
+    emit({
+      type: "phase",
+      phase: "ACTIVATING",
+      message: "Activating verified rule and disabling older active versions."
+    });
+    const combinedResults = serializeVerificationResults({
+      generated: generatedTestResults,
+      app: appTestResults
+    });
+    await prisma.$transaction([
+      prisma.rule.updateMany({
+        where: {
+          slug,
+          id: { not: rule.id },
+          status: RULE_STATUSES.ACTIVE
+        },
+        data: { status: RULE_STATUSES.DISABLED }
+      }),
+      prisma.rule.update({
+        where: { id: rule.id },
+        data: {
+          status: RULE_STATUSES.ACTIVE,
+          generatedTestResults: JSON.stringify(generatedTestResults, null, 2),
+          appTestResults: JSON.stringify(appTestResults, null, 2),
+          testResults: combinedResults
+        }
+      })
+    ]);
+
     const result = {
       id: rule.id,
-      status,
-      accepted: status === RULE_STATUSES.ACTIVE,
-      testResults: serializedResults
+      status: RULE_STATUSES.ACTIVE,
+      accepted: true,
+      testResults: combinedResults
     };
     emit({
       type: "phase",
-      phase: result.accepted ? "ACTIVE" : "FAILED",
-      message: result.accepted
-        ? "Generated rule passed verification and is active."
-        : "Generated rule failed verification."
+      phase: "ACTIVE",
+      message: "Generated rule passed verification and is active."
     });
     emit({ type: "result", result });
     return result;
@@ -261,35 +303,58 @@ export function slugify(value: string): string {
 }
 
 export function validateGeneratedModuleSource(moduleCode: string): void {
-  if (!/export\s+function\s+describe\s*\(/.test(moduleCode)) {
-    throw new Error("Generated module must export describe().");
-  }
+  const sourceFile = parseSource("generated-rule.ts", moduleCode);
+  const exportedFunctions = new Set<string>();
 
-  if (!/export\s+function\s+apply\s*\(/.test(moduleCode)) {
-    throw new Error("Generated module must export apply().");
-  }
+  for (const statement of sourceFile.statements) {
+    if (ts.isImportDeclaration(statement)) {
+      validateImportDeclaration(statement, {
+        allowedModules: new Set(["../contract"]),
+        requireTypeOnly: true
+      });
+    }
 
-  const importStatements = moduleCode.match(/^import\s+.+$/gm) ?? [];
-
-  for (const importStatement of importStatements) {
-    if (!/from\s+["']\.\.\/contract["'];?$/.test(importStatement)) {
-      throw new Error("Generated module may only import ../contract.");
+    if (
+      ts.isFunctionDeclaration(statement) &&
+      statement.name &&
+      hasExportModifier(statement)
+    ) {
+      exportedFunctions.add(statement.name.text);
     }
   }
 
-  const forbiddenPatterns = [
-    /\bfetch\s*\(/,
-    /\bDate\.now\s*\(/,
-    /\bnew\s+Date\s*\(/,
-    /\bfs\b/,
-    /\bchild_process\b/,
-    /\bprocess\b/,
-    /\brequire\s*\(/
-  ];
-
-  if (forbiddenPatterns.some((pattern) => pattern.test(moduleCode))) {
-    throw new Error("Generated module uses a forbidden API.");
+  if (!exportedFunctions.has("describe")) {
+    throw new Error("Generated module must export describe().");
   }
+
+  if (!exportedFunctions.has("apply")) {
+    throw new Error("Generated module must export apply().");
+  }
+
+  validateForbiddenSyntax(sourceFile);
+}
+
+export function validateGeneratedTestSource(
+  testCode: string,
+  moduleImportPath: string
+): void {
+  const sourceFile = parseSource("generated-rule.test.ts", testCode);
+  const allowedModules = new Set(["vitest", moduleImportPath]);
+
+  for (const statement of sourceFile.statements) {
+    if (ts.isImportDeclaration(statement)) {
+      if (isAllowedGeneratedTestTypeImport(statement)) {
+        continue;
+      }
+
+      validateImportDeclaration(statement, {
+        allowedModules,
+        requireTypeOnly: false
+      });
+    }
+  }
+
+  validateForbiddenSyntax(sourceFile);
 }
 
 export function appendSystemSafetyTest(
@@ -443,24 +508,41 @@ export function createCodexChildEnv(): Record<string, string> {
       continue;
     }
 
-    env[key] = value;
+    env[key] = key === "PATH" ? sanitizeCodexChildPath(value) : value;
   }
 
   return env;
 }
 
+export function sanitizeCodexChildPath(value: string): string {
+  const entries = value
+    .split(path.delimiter)
+    .filter((entry) => entry.length > 0)
+    .filter((entry) => !entry.includes(`${path.sep}.codex${path.sep}tmp${path.sep}arg0`))
+    .filter((entry) => !entry.includes(`${path.sep}codex.system${path.sep}`));
+
+  if (entries.length > 0) {
+    return entries.join(path.delimiter);
+  }
+
+  return ["/usr/local/bin", "/usr/bin", "/bin"].join(path.delimiter);
+}
+
 async function runVitestForGeneratedRule(
   testPath: string
 ): Promise<TestRunResult> {
-  const command = `npx vitest run --config vitest.generated.config.ts ${testPath}`;
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "shop-next-rule-test-"));
+  const command = `vitest run --config vitest.generated.config.ts ${testPath}`;
   const startedAt = Date.now();
 
   try {
+    await prepareGeneratedTestWorkspace(tempRoot, testPath);
     const result = await execFileAsync(
-      "npx",
-      ["vitest", "run", "--config", "vitest.generated.config.ts", testPath],
+      path.join(process.cwd(), "node_modules/.bin/vitest"),
+      ["run", "--config", "vitest.generated.config.ts", testPath],
       {
-        cwd: process.cwd(),
+        cwd: tempRoot,
+        env: createGeneratedTestEnv(),
         timeout: 20_000
       }
     );
@@ -487,7 +569,61 @@ async function runVitestForGeneratedRule(
       stderr: failed.stderr ?? failed.message ?? "",
       durationMs: Date.now() - startedAt
     };
+  } finally {
+    await rm(tempRoot, { force: true, recursive: true });
   }
+}
+
+async function prepareGeneratedTestWorkspace(
+  tempRoot: string,
+  testPath: string
+): Promise<void> {
+  const modulePath = testPath.replace(/\.test\.ts$/, ".ts");
+  const contractPath = "src/lib/discounts/contract.ts";
+
+  await mkdir(path.dirname(path.join(tempRoot, testPath)), { recursive: true });
+  await cp(path.join(process.cwd(), modulePath), path.join(tempRoot, modulePath));
+  await cp(path.join(process.cwd(), testPath), path.join(tempRoot, testPath));
+  await cp(
+    path.join(process.cwd(), contractPath),
+    path.join(tempRoot, contractPath)
+  );
+  await symlink(
+    path.join(process.cwd(), "node_modules"),
+    path.join(tempRoot, "node_modules"),
+    "dir"
+  );
+  await writeFile(
+    path.join(tempRoot, "vitest.generated.config.ts"),
+    `import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+  test: {
+    environment: "node",
+    globals: true,
+    include: ["src/lib/discounts/generated/**/*.test.ts"],
+    pool: "forks"
+  }
+});
+`
+  );
+}
+
+function createGeneratedTestEnv(): NodeJS.ProcessEnv {
+  const env = {} as NodeJS.ProcessEnv;
+
+  for (const key of ["PATH", "HOME", "TMPDIR", "TEMP", "TMP"]) {
+    const value = process.env[key];
+
+    if (value) {
+      env[key] = value;
+    }
+  }
+
+  return {
+    ...env,
+    NODE_ENV: "test"
+  };
 }
 
 async function reviewDiscountPolicy(
@@ -514,6 +650,41 @@ async function reviewDiscountPolicy(
   }
 
   return { accepted: true, reason: "Policy review passed." };
+}
+
+async function failVerifiedRule(
+  prisma: PrismaClient,
+  id: string,
+  emit: (event: GenerationEvent) => void,
+  results: VerificationResults
+): Promise<RuleGenerationResult> {
+  const testResults = serializeVerificationResults(results);
+
+  await prisma.rule.update({
+    where: { id },
+    data: {
+      status: RULE_STATUSES.FAILED,
+      generatedTestResults: results.generated
+        ? JSON.stringify(results.generated, null, 2)
+        : undefined,
+      appTestResults: results.app ? JSON.stringify(results.app, null, 2) : undefined,
+      testResults
+    }
+  });
+
+  const result = {
+    id,
+    status: RULE_STATUSES.FAILED,
+    accepted: false,
+    testResults
+  };
+  emit({
+    type: "phase",
+    phase: "FAILED",
+    message: "Generated rule failed verification."
+  });
+  emit({ type: "result", result });
+  return result;
 }
 
 async function failRule(
@@ -547,6 +718,205 @@ async function failRule(
     accepted: false,
     testResults
   };
+}
+
+async function createGeneratingRule(
+  prisma: PrismaClient,
+  slug: string,
+  source: string
+) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const version = await nextVersionForSlug(prisma, slug);
+    const modulePath = `${generatedDirectory}/${slug}.v${version}.ts`;
+    const testPath = `${generatedDirectory}/${slug}.v${version}.test.ts`;
+
+    try {
+      const rule = await prisma.rule.create({
+        data: {
+          source,
+          slug,
+          version,
+          status: RULE_STATUSES.GENERATING,
+          modulePath,
+          testPath
+        }
+      });
+
+      return { rule, version, modulePath, testPath };
+    } catch (error) {
+      if (isUniqueConstraintError(error)) {
+        continue;
+      }
+
+      throw error;
+    }
+  }
+
+  throw new Error("Could not reserve a unique generated rule version.");
+}
+
+function parseSource(filename: string, source: string): ts.SourceFile {
+  const sourceFile = ts.createSourceFile(
+    filename,
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TS
+  );
+
+  const diagnostics = (
+    sourceFile as ts.SourceFile & {
+      parseDiagnostics: readonly ts.Diagnostic[];
+    }
+  ).parseDiagnostics;
+
+  if (diagnostics.length > 0) {
+    throw new Error("Generated source contains invalid TypeScript syntax.");
+  }
+
+  return sourceFile;
+}
+
+function validateImportDeclaration(
+  statement: ts.ImportDeclaration,
+  options: {
+    allowedModules: Set<string>;
+    requireTypeOnly: boolean;
+  }
+): void {
+  const moduleName = ts.isStringLiteral(statement.moduleSpecifier)
+    ? statement.moduleSpecifier.text
+    : "";
+
+  if (!options.allowedModules.has(moduleName)) {
+    throw new Error("Generated source imports a forbidden module.");
+  }
+
+  if (options.requireTypeOnly && !statement.importClause?.isTypeOnly) {
+    throw new Error("Generated module may only type-import ../contract.");
+  }
+}
+
+function isAllowedGeneratedTestTypeImport(
+  statement: ts.ImportDeclaration
+): boolean {
+  return (
+    ts.isStringLiteral(statement.moduleSpecifier) &&
+    statement.moduleSpecifier.text === "../contract" &&
+    statement.importClause?.isTypeOnly === true
+  );
+}
+
+function validateForbiddenSyntax(sourceFile: ts.SourceFile): void {
+  const forbiddenIdentifiers = new Set([
+    "require",
+    "process",
+    "globalThis",
+    "fetch",
+    "eval",
+    "Function"
+  ]);
+  const forbiddenModules = new Set([
+    "fs",
+    "node:fs",
+    "fs/promises",
+    "node:fs/promises",
+    "child_process",
+    "node:child_process",
+    "http",
+    "node:http",
+    "https",
+    "node:https",
+    "net",
+    "node:net",
+    "dns",
+    "node:dns"
+  ]);
+
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+      throw new Error("Generated source may not use dynamic import.");
+    }
+
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
+      if (forbiddenIdentifiers.has(node.expression.text)) {
+        throw new Error("Generated source uses a forbidden API.");
+      }
+    }
+
+    if (ts.isNewExpression(node) && ts.isIdentifier(node.expression)) {
+      if (
+        node.expression.text === "Date" &&
+        !isDeterministicDateConstruction(node)
+      ) {
+        throw new Error("Generated source uses a forbidden API.");
+      }
+
+      if (node.expression.text === "Function") {
+        throw new Error("Generated source uses a forbidden API.");
+      }
+    }
+
+    if (
+      ts.isPropertyAccessExpression(node) &&
+      ts.isIdentifier(node.expression) &&
+      node.expression.text === "Date" &&
+      node.name.text === "now"
+    ) {
+      throw new Error("Generated source uses a forbidden API.");
+    }
+
+    if (ts.isIdentifier(node) && forbiddenModules.has(node.text)) {
+      throw new Error("Generated source references a forbidden module.");
+    }
+
+    ts.forEachChild(node, visit);
+  };
+
+  ts.forEachChild(sourceFile, visit);
+}
+
+function isDeterministicDateConstruction(node: ts.NewExpression): boolean {
+  if (
+    node.arguments?.length === 1 &&
+    ts.isPropertyAccessExpression(node.arguments[0]) &&
+    node.arguments[0].name.text === "placedAt" &&
+    ts.isIdentifier(node.arguments[0].expression) &&
+    node.arguments[0].expression.text === "cart"
+  ) {
+    return true;
+  }
+
+  return (
+    node.arguments?.length === 1 &&
+    ts.isCallExpression(node.arguments[0]) &&
+    ts.isPropertyAccessExpression(node.arguments[0].expression) &&
+    ts.isIdentifier(node.arguments[0].expression.expression) &&
+    node.arguments[0].expression.expression.text === "Date" &&
+    node.arguments[0].expression.name.text === "UTC"
+  );
+}
+
+function hasExportModifier(node: ts.Node): boolean {
+  return (
+    ts.canHaveModifiers(node) &&
+    (ts.getModifiers(node) ?? []).some(
+      (modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword
+    )
+  );
+}
+
+function serializeVerificationResults(results: VerificationResults): string {
+  return JSON.stringify(results, null, 2);
+}
+
+function isUniqueConstraintError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === "P2002"
+  );
 }
 
 async function nextVersionForSlug(

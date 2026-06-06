@@ -101,7 +101,7 @@ describe("rules admin test status panels", () => {
 });
 
 describe("rules admin pipeline status", () => {
-  it("advances through generation, source review, tests, activation, and app tests", () => {
+  it("advances through generation, source review, tests, app tests, and activation", () => {
     let state = startRulePipeline();
 
     state = applyRulePipelineEvent(state, {
@@ -131,13 +131,8 @@ describe("rules admin pipeline status", () => {
     });
     state = applyRulePipelineEvent(state, {
       type: "phase",
-      phase: "ACTIVATING",
-      message: "Activating."
-    });
-    state = applyRulePipelineEvent(state, {
-      type: "phase",
-      phase: "ACTIVE",
-      message: "Activated."
+      phase: "APP_TESTING",
+      message: "Running app tests."
     });
     state = applyRulePipelineEvent(state, {
       type: "appTestStatus",
@@ -151,17 +146,27 @@ describe("rules admin pipeline status", () => {
         durationMs: 20
       }
     });
+    state = applyRulePipelineEvent(state, {
+      type: "phase",
+      phase: "ACTIVATING",
+      message: "Activating."
+    });
+    state = applyRulePipelineEvent(state, {
+      type: "phase",
+      phase: "ACTIVE",
+      message: "Activated."
+    });
 
     expect(state.steps.map((step) => [step.id, step.status])).toEqual([
       ["policy", "PASSED"],
       ["codex", "PASSED"],
       ["sourceReview", "PASSED"],
       ["generatedTests", "PASSED"],
-      ["activation", "PASSED"],
-      ["appTests", "PASSED"]
+      ["appTests", "PASSED"],
+      ["activation", "PASSED"]
     ]);
-    expect(state.consoleTitle).toBe("Built-in app tests");
-    expect(state.consoleOutput).toContain("npm test");
+    expect(state.consoleTitle).toBe("Rule activation");
+    expect(state.consoleOutput).toBe("Activated.");
   });
 
   it("marks the running step as failed when the pipeline fails", () => {

@@ -49,7 +49,7 @@ export function apply(cart: Cart): DiscountResult;
 
 Policy source of truth: `references/policy.md`.
 
-- **Pure and deterministic.** No I/O, no network, no `Date.now()` or `new Date()` — read time only from `cart.placedAt`.
+- **Pure and deterministic.** No I/O, no network, no wall-clock time. Do not use `Date.now()` or no-argument `new Date()`. For day/time conditions, read time only from `cart.placedAt`; deterministic parsing such as `new Date(cart.placedAt)` or `new Date(Date.UTC(year, month, day))` is allowed.
 - **No external dependencies.** Standard library only.
 - **Money is integer pence.** Never use floats for money.
 - `apply` returns `discount` = pence to subtract from the subtotal. Return `{ discount: 0, explanation }` when the promo does not apply.

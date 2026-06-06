@@ -79,6 +79,48 @@ describe("rule lifecycle", () => {
     expect(older.id).not.toBe(newer.id);
   });
 
+  it("rejects manual activation without complete passing verification results", async () => {
+    const missingApp = await prisma.rule.create({
+      data: {
+        source: "missing app verification",
+        slug: "missing-app-verification",
+        version: 1,
+        status: RULE_STATUSES.DISABLED,
+        modulePath: "src/lib/discounts/generated/missing-app-verification.v1.ts",
+        testPath:
+          "src/lib/discounts/generated/missing-app-verification.v1.test.ts",
+        moduleCode: "export function describe() { return 'x'; }",
+        testCode: "test code",
+        generatedTestResults: JSON.stringify({ exitCode: 0 }),
+        testResults: JSON.stringify({ exitCode: 0 })
+      }
+    });
+    const failedGenerated = await prisma.rule.create({
+      data: {
+        source: "failed generated verification",
+        slug: "failed-generated-verification",
+        version: 1,
+        status: RULE_STATUSES.DISABLED,
+        modulePath:
+          "src/lib/discounts/generated/failed-generated-verification.v1.ts",
+        testPath:
+          "src/lib/discounts/generated/failed-generated-verification.v1.test.ts",
+        moduleCode: "export function describe() { return 'x'; }",
+        testCode: "test code",
+        generatedTestResults: JSON.stringify({ exitCode: 2 }),
+        appTestResults: JSON.stringify({ exitCode: 0 }),
+        testResults: JSON.stringify({ exitCode: 0 })
+      }
+    });
+
+    await expect(
+      activateRule(missingApp.id, { prisma, revalidate: false })
+    ).rejects.toThrow("Only verified");
+    await expect(
+      activateRule(failedGenerated.id, { prisma, revalidate: false })
+    ).rejects.toThrow("Only verified");
+  });
+
   it("failed edits do not disable the current active version", async () => {
     const current = await createVerifiedRule("failed-edit", 1, "ACTIVE");
 
@@ -171,7 +213,12 @@ async function createVerifiedRule(
         `src/lib/discounts/generated/${slug}.v${version}.test.ts`,
       moduleCode: "export function describe() { return 'x'; }",
       testCode: "test code",
-      testResults: JSON.stringify({ exitCode: 0 })
+      generatedTestResults: JSON.stringify({ exitCode: 0 }),
+      appTestResults: JSON.stringify({ exitCode: 0 }),
+      testResults: JSON.stringify({
+        generated: { exitCode: 0 },
+        app: { exitCode: 0 }
+      })
     }
   });
 }

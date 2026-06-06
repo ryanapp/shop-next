@@ -60,9 +60,11 @@ model Rule {
   moduleCode  String?
   testCode    String?
   testResults String?
+  generatedTestResults String?
+  appTestResults String?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
   @@index([status])
-  @@index([slug, version])
+  @@unique([slug, version])
 }

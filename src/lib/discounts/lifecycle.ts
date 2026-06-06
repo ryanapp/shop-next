@@ -104,9 +104,25 @@ function isVerifiedRule(rule: Rule): boolean {
     Boolean(rule.testCode) &&
     Boolean(rule.modulePath) &&
     Boolean(rule.testPath) &&
-    Boolean(rule.testResults) &&
-    !rule.testResults?.includes('"exitCode": 1')
+    testRunPassed(rule.generatedTestResults) &&
+    testRunPassed(rule.appTestResults)
   );
+}
+
+function testRunPassed(serializedResults: string | null): boolean {
+  if (!serializedResults) {
+    return false;
+  }
+
+  try {
+    const parsed = JSON.parse(serializedResults) as {
+      exitCode?: unknown;
+    };
+
+    return parsed.exitCode === 0;
+  } catch {
+    return false;
+  }
 }
 
 async function deleteGeneratedFile(filePath: string | null): Promise<void> {
