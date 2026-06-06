@@ -68,8 +68,8 @@ export function createInitialPipelineState(): RulePipelineState {
       { id: "codex", label: "Codex rule generation", status: "PENDING" },
       { id: "sourceReview", label: "Source validation", status: "PENDING" },
       { id: "generatedTests", label: "Generated rule tests", status: "PENDING" },
-      { id: "activation", label: "Rule activation", status: "PENDING" },
-      { id: "appTests", label: "Built-in app tests", status: "PENDING" }
+      { id: "appTests", label: "Built-in app tests", status: "PENDING" },
+      { id: "activation", label: "Rule activation", status: "PENDING" }
     ]
   };
 }
@@ -182,7 +182,7 @@ function applyPhaseEvent(
 
   if (phase === "ACTIVATING") {
     return updateStep(
-      updateStep(state, "generatedTests", "PASSED"),
+      updateStep(state, "appTests", "PASSED"),
       "activation",
       "RUNNING",
       {
@@ -197,6 +197,18 @@ function applyPhaseEvent(
       consoleTitle: "Rule activation",
       consoleOutput: message
     });
+  }
+
+  if (phase === "APP_TESTING") {
+    return updateStep(
+      updateStep(state, "generatedTests", "PASSED"),
+      "appTests",
+      "RUNNING",
+      {
+        consoleTitle: "Built-in app tests",
+        consoleOutput: message
+      }
+    );
   }
 
   if (phase === "FAILED") {

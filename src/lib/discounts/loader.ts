@@ -10,10 +10,14 @@ const generatedDirectory = path.join(
   process.cwd(),
   "src/lib/discounts/generated"
 );
+const runtimeTimeoutMs = 100;
 
-type GeneratedModule = {
-  describe?: unknown;
-  apply?: unknown;
+type GeneratedContext = vm.Context & {
+  exports: {
+    describe?: unknown;
+    apply?: unknown;
+  };
+  __cart?: Cart;
 };
 
 export function isGeneratedRulePath(modulePath: string): boolean {
@@ -38,23 +42,9 @@ export async function loadActiveDiscountRules(): Promise<DiscountRule[]> {
     }
 
     try {
-      const generatedModule = await loadGeneratedModule(
-        path.resolve(process.cwd(), rule.modulePath)
+      loadedRules.push(
+        await loadGeneratedRule(rule.id, path.resolve(process.cwd(), rule.modulePath))
       );
-
-      if (
-        typeof generatedModule.describe !== "function" ||
-        typeof generatedModule.apply !== "function"
-      ) {
-        await markRuleLoadFailed(rule.id, "Generated module exports are invalid.");
-        continue;
-      }
-
-      loadedRules.push({
-        id: rule.id,
-        describe: generatedModule.describe as () => string,
-        apply: generatedModule.apply as (cart: Cart) => DiscountResult
-      });
     } catch (error) {
       await markRuleLoadFailed(
         rule.id,
@@ -67,7 +57,27 @@ export async function loadActiveDiscountRules(): Promise<DiscountRule[]> {
   return loadedRules;
 }
 
-async function loadGeneratedModule(modulePath: string): Promise<GeneratedModule> {
+async function loadGeneratedRule(
+  id: string,
+  modulePath: string
+): Promise<DiscountRule> {
+  const context = await loadGeneratedContext(modulePath);
+
+  if (
+    typeof context.exports.describe !== "function" ||
+    typeof context.exports.apply !== "function"
+  ) {
+    throw new Error("Generated module exports are invalid.");
+  }
+
+  return {
+    id,
+    describe: () => safeDescribe(context),
+    apply: (cart) => safeApply(context, cart)
+  };
+}
+
+async function loadGeneratedContext(modulePath: string): Promise<GeneratedContext> {
   await access(modulePath);
   const source = await readFile(modulePath, "utf8");
   const transpiled = ts.transpileModule(source, {
@@ -78,21 +88,92 @@ async function loadGeneratedModule(modulePath: string): Promise<GeneratedModule>
       esModuleInterop: true
     }
   }).outputText;
-  const exports: GeneratedModule = {};
   const context = vm.createContext({
-    exports,
+    exports: {},
     console: undefined,
     require: undefined,
     process: undefined,
-    fetch: undefined
-  });
+    fetch: undefined,
+    globalThis: undefined
+  }) as GeneratedContext;
 
   const script = new vm.Script(transpiled, {
     filename: modulePath
   });
-  script.runInContext(context, { timeout: 1000 });
+  script.runInContext(context, { timeout: runtimeTimeoutMs });
 
-  return exports;
+  return context;
+}
+
+function safeDescribe(context: GeneratedContext): string {
+  try {
+    const value = new vm.Script("exports.describe()", {
+      filename: "generated-describe.vm.js"
+    }).runInContext(context, { timeout: runtimeTimeoutMs });
+
+    return typeof value === "string" && value.trim().length > 0
+      ? value
+      : "Generated discount";
+  } catch {
+    return "Generated discount";
+  }
+}
+
+function safeApply(context: GeneratedContext, cart: Cart): DiscountResult {
+  try {
+    context.__cart = cloneCart(cart);
+    const value = new vm.Script("exports.apply(__cart)", {
+      filename: "generated-apply.vm.js"
+    }).runInContext(context, { timeout: runtimeTimeoutMs });
+
+    return normalizeDiscountResult(value);
+  } catch {
+    return safeNoDiscount("Generated rule failed safely.");
+  } finally {
+    delete context.__cart;
+  }
+}
+
+function cloneCart(cart: Cart): Cart {
+  return JSON.parse(JSON.stringify(cart)) as Cart;
+}
+
+function normalizeDiscountResult(value: unknown): DiscountResult {
+  if (typeof value !== "object" || value === null) {
+    return safeNoDiscount("Generated rule returned an invalid result.");
+  }
+
+  const result = value as {
+    discount?: unknown;
+    explanation?: unknown;
+  };
+
+  const discount = result.discount;
+  const explanation = result.explanation;
+
+  if (
+    typeof discount !== "number" ||
+    !Number.isInteger(discount) ||
+    typeof explanation !== "string"
+  ) {
+    return safeNoDiscount("Generated rule returned an invalid result.");
+  }
+
+  if (discount < 0) {
+    return safeNoDiscount("Generated rule returned an unsafe discount.");
+  }
+
+  return {
+    discount,
+    explanation
+  };
+}
+
+function safeNoDiscount(explanation: string): DiscountResult {
+  return {
+    discount: 0,
+    explanation
+  };
 }
 
 async function markRuleLoadFailed(id: string, reason: string): Promise<void> {

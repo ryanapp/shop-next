@@ -9,6 +9,8 @@ import { cartSummaryToDiscountCart } from "../src/lib/discounts/adapter";
 import {
   createCodexChildEnv,
   generateDiscountRule,
+  validateGeneratedModuleSource,
+  validateGeneratedTestSource,
   type GeneratedRuleSources
 } from "../src/lib/discounts/generate";
 import { priceCartWithRules } from "../src/lib/discounts/engine";
@@ -52,7 +54,8 @@ describe("discount rule generation pipeline", () => {
       {
         prisma,
         createSources: ({ slug, version }) =>
-          Promise.resolve(createTeaDiscountSources(slug, version))
+          Promise.resolve(createTeaDiscountSources(slug, version)),
+        runAppTests: async () => passingAppTestResults()
       }
     );
 
@@ -65,7 +68,10 @@ describe("discount rule generation pipeline", () => {
     expect(rule.status).toBe(RULE_STATUSES.ACTIVE);
     expect(rule.moduleCode).toContain("export function apply");
     expect(rule.testCode).toContain("system-owned discount safety");
-    expect(rule.testResults).toContain("\"exitCode\": 0");
+    expect(rule.generatedTestResults).toContain("\"exitCode\": 0");
+    expect(rule.appTestResults).toContain("\"exitCode\": 0");
+    expect(rule.testResults).toContain("\"generated\"");
+    expect(rule.testResults).toContain("\"app\"");
   });
 
   it("marks a rule failed when source generation throws", async () => {
@@ -98,7 +104,8 @@ describe("discount rule generation pipeline", () => {
     const result = await generateDiscountRule("Give a risky tea discount", {
       prisma,
       createSources: ({ slug, version }) =>
-        Promise.resolve(createNegativeDiscountSources(slug, version))
+        Promise.resolve(createNegativeDiscountSources(slug, version)),
+      runAppTests: async () => passingAppTestResults()
     });
 
     const rule = await prisma.rule.findUniqueOrThrow({
@@ -109,6 +116,31 @@ describe("discount rule generation pipeline", () => {
     expect(result.status).toBe(RULE_STATUSES.FAILED);
     expect(rule.testCode).toContain("system-owned discount safety");
     expect(rule.testResults).toContain("toBeGreaterThanOrEqual");
+  });
+
+  it("does not activate a generated rule when built-in app tests fail", async () => {
+    const result = await generateDiscountRule("Give 10% off bags", {
+      prisma,
+      createSources: ({ slug, version }) =>
+        Promise.resolve(createTeaDiscountSources(slug, version)),
+      runAppTests: async () => ({
+        command: "npm test",
+        exitCode: 1,
+        stdout: "",
+        stderr: "app tests failed",
+        durationMs: 1
+      })
+    });
+
+    const rule = await prisma.rule.findUniqueOrThrow({
+      where: { id: result.id }
+    });
+
+    expect(result.accepted).toBe(false);
+    expect(result.status).toBe(RULE_STATUSES.FAILED);
+    expect(rule.status).toBe(RULE_STATUSES.FAILED);
+    expect(rule.generatedTestResults).toContain("\"exitCode\": 0");
+    expect(rule.appTestResults).toContain("\"exitCode\": 1");
   });
 });
 
@@ -190,6 +222,52 @@ describe("discount cart pricing", () => {
       true
     );
     expect(isGeneratedRulePath("../outside.ts")).toBe(false);
+  });
+});
+
+describe("generated source validation", () => {
+  it("rejects generated modules with non-type imports or forbidden APIs", () => {
+    expect(() =>
+      validateGeneratedModuleSource(`import { readFileSync } from "fs";
+
+export function describe(): string {
+  return "bad";
+}
+
+export function apply() {
+  return { discount: 0, explanation: readFileSync(".env", "utf8") };
+}
+`)
+    ).toThrow("forbidden module");
+
+    expect(() =>
+      validateGeneratedModuleSource(`import { Cart } from "../contract";
+
+export function describe(): string {
+  return "bad";
+}
+
+export function apply(cart: Cart) {
+  return { discount: Date.now() > 0 ? 1 : 0, explanation: "bad" };
+}
+`)
+    ).toThrow("type-import");
+  });
+
+  it("rejects generated tests that import outside vitest and the generated module", () => {
+    expect(() =>
+      validateGeneratedTestSource(`import { describe, expect, it } from "vitest";
+import { readFileSync } from "fs";
+import { apply } from "./tea.v1";
+
+describe("bad", () => {
+  it("reads secrets", () => {
+    expect(readFileSync(".env", "utf8")).toBeTruthy();
+    expect(apply({ items: [], subtotal: 0, placedAt: "2026-06-06T12:00:00.000Z" }).discount).toBe(0);
+  });
+});
+`, "./tea.v1")
+    ).toThrow("forbidden module");
   });
 });
 
@@ -296,5 +374,15 @@ describe("risky discount", () => {
   });
 });
 `
+  };
+}
+
+function passingAppTestResults() {
+  return {
+    command: "npm test",
+    exitCode: 0,
+    stdout: "passed",
+    stderr: "",
+    durationMs: 1
   };
 }

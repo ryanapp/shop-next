@@ -2,26 +2,15 @@ import { NextResponse } from "next/server";
 import { prisma } from "../../../../lib/db";
 import {
   generateDiscountRule,
-  type GenerationEvent,
-  type RuleGenerationResult
+  type GenerationEvent
 } from "../../../../lib/discounts/generate";
 import { revalidateRuleViews } from "../../../../lib/discounts/lifecycle";
 import { requireRuleManager } from "../../../../lib/rules/auth";
-import { runBuiltInAppTests } from "../../../../lib/verification/app-tests";
 
 type StreamPayload = {
   prompt?: unknown;
   editRuleId?: unknown;
 };
-
-type StreamEvent =
-  | GenerationEvent
-  | {
-      type: "appTestStatus";
-      status: "RUNNING" | "PASSED" | "FAILED";
-      message: string;
-      results?: Awaited<ReturnType<typeof runBuiltInAppTests>>;
-    };
 
 export async function POST(request: Request) {
   const session = await requireRuleManager();
@@ -48,7 +37,7 @@ export async function POST(request: Request) {
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       const encoder = new TextEncoder();
-      const send = (event: StreamEvent) => {
+      const send = (event: GenerationEvent) => {
         controller.enqueue(encoder.encode(`${JSON.stringify(event)}\n`));
       };
 
@@ -63,30 +52,11 @@ export async function POST(request: Request) {
           slug = existingRule.slug;
         }
 
-        const result: RuleGenerationResult = await generateDiscountRule(
-          prompt,
-          {
-            slug,
-            onEvent: send
-          }
-        );
+        await generateDiscountRule(prompt, {
+          slug,
+          onEvent: send
+        });
 
-        send({
-          type: "appTestStatus",
-          status: "RUNNING",
-          message: "Running built-in app test suite."
-        });
-        const appTestResults = await runBuiltInAppTests();
-        send({
-          type: "appTestStatus",
-          status: appTestResults.exitCode === 0 ? "PASSED" : "FAILED",
-          message:
-            appTestResults.exitCode === 0
-              ? "Built-in app tests passed."
-              : "Built-in app tests failed.",
-          results: appTestResults
-        });
-        send({ type: "result", result });
         revalidateRuleViews();
       } catch (error) {
         send({
