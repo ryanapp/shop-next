@@ -1,0 +1,300 @@
+import { execFileSync } from "node:child_process";
+import { mkdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { PrismaClient } from "@prisma/client";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { buildCartSummary } from "../src/lib/cart";
+import { cartSummaryToDiscountCart } from "../src/lib/discounts/adapter";
+import {
+  createCodexChildEnv,
+  generateDiscountRule,
+  type GeneratedRuleSources
+} from "../src/lib/discounts/generate";
+import { priceCartWithRules } from "../src/lib/discounts/engine";
+import { formatStorePlacedAt } from "../src/lib/discounts/pricing";
+import { RULE_STATUSES } from "../src/lib/discounts/status";
+import { isGeneratedRulePath } from "../src/lib/discounts/loader";
+
+const databaseDir = join(tmpdir(), `shop-next-discounts-${process.pid}`);
+const databaseUrl = `file:${join(databaseDir, "test.db")}`;
+
+let prisma: PrismaClient;
+
+describe("discount rule generation pipeline", () => {
+  beforeAll(async () => {
+    mkdirSync(databaseDir, { recursive: true });
+    execFileSync("npx", ["prisma", "db", "push", "--skip-generate"], {
+      env: {
+        ...process.env,
+        DATABASE_URL: databaseUrl
+      },
+      stdio: "pipe"
+    });
+
+    prisma = new PrismaClient({
+      datasources: {
+        db: {
+          url: databaseUrl
+        }
+      }
+    });
+  });
+
+  afterAll(async () => {
+    await prisma.$disconnect();
+    rmSync(databaseDir, { force: true, recursive: true });
+  });
+
+  it("activates a generated rule only after its generated and safety tests pass", async () => {
+    const result = await generateDiscountRule(
+      "Give 10% off tea when the basket total is over £30",
+      {
+        prisma,
+        createSources: ({ slug, version }) =>
+          Promise.resolve(createTeaDiscountSources(slug, version))
+      }
+    );
+
+    const rule = await prisma.rule.findUniqueOrThrow({
+      where: { id: result.id }
+    });
+
+    expect(result.accepted).toBe(true);
+    expect(result.status).toBe(RULE_STATUSES.ACTIVE);
+    expect(rule.status).toBe(RULE_STATUSES.ACTIVE);
+    expect(rule.moduleCode).toContain("export function apply");
+    expect(rule.testCode).toContain("system-owned discount safety");
+    expect(rule.testResults).toContain("\"exitCode\": 0");
+  });
+
+  it("marks a rule failed when source generation throws", async () => {
+    const result = await generateDiscountRule("Give 10% off mugs", {
+      prisma,
+      createSources: async () => {
+        throw new Error("Codex generation failed");
+      }
+    });
+
+    expect(result.accepted).toBe(false);
+    expect(result.status).toBe(RULE_STATUSES.FAILED);
+    expect(result.testResults).toContain("Codex generation failed");
+  });
+
+  it("rejects invalid price-increase prompts before code generation", async () => {
+    const result = await generateDiscountRule("Add a £2 surcharge to tea", {
+      prisma,
+      createSources: async () => {
+        throw new Error("should not generate source");
+      }
+    });
+
+    expect(result.accepted).toBe(false);
+    expect(result.status).toBe(RULE_STATUSES.FAILED);
+    expect(result.testResults).toContain("Policy rejection");
+  });
+
+  it("fails verification when the system safety test catches a negative discount", async () => {
+    const result = await generateDiscountRule("Give a risky tea discount", {
+      prisma,
+      createSources: ({ slug, version }) =>
+        Promise.resolve(createNegativeDiscountSources(slug, version))
+    });
+
+    const rule = await prisma.rule.findUniqueOrThrow({
+      where: { id: result.id }
+    });
+
+    expect(result.accepted).toBe(false);
+    expect(result.status).toBe(RULE_STATUSES.FAILED);
+    expect(rule.testCode).toContain("system-owned discount safety");
+    expect(rule.testResults).toContain("toBeGreaterThanOrEqual");
+  });
+});
+
+describe("Codex SDK runtime environment", () => {
+  it("does not pass outer Codex agent sandbox variables to the child generator", () => {
+    process.env.CODEX_SANDBOX = "seatbelt";
+    process.env.CODEX_THREAD_ID = "outer-thread";
+    process.env.AUTH_SECRET = "test-secret";
+
+    const env = createCodexChildEnv();
+
+    expect(env.CODEX_SANDBOX).toBeUndefined();
+    expect(env.CODEX_THREAD_ID).toBeUndefined();
+    expect(env.AUTH_SECRET).toBe("test-secret");
+  });
+});
+
+describe("discount cart pricing", () => {
+  it("formats rule timestamps in UK store-local time with an offset", () => {
+    expect(formatStorePlacedAt(new Date("2026-06-06T12:30:00.000Z"))).toBe(
+      "2026-06-06T13:30:00+01:00"
+    );
+  });
+
+  it("adapts cart summaries and prices carts through rules without hard-coded promos", () => {
+    const summary = buildCartSummary([
+      {
+        quantity: 3,
+        product: {
+          id: "tea",
+          sku: "TEA-BLK-003",
+          name: "Pier Breakfast Tea Tin",
+          category: "pantry",
+          pricePence: 1250
+        }
+      },
+      {
+        quantity: 1,
+        product: {
+          id: "bag",
+          sku: "BAG-CNV-002",
+          name: "Canvas Beach Market Tote",
+          category: "bags",
+          pricePence: 2400
+        }
+      }
+    ]);
+
+    const discountCart = cartSummaryToDiscountCart(
+      summary,
+      "2026-06-06T12:00:00.000Z"
+    );
+    const pricing = priceCartWithRules(discountCart, [
+      {
+        id: "rule_tea",
+        describe: () => "10% off tea baskets over £30",
+        apply: () => ({
+          discount: 375,
+          explanation: "Tea discount applied"
+        })
+      },
+      {
+        id: "rule_bad",
+        describe: () => "Invalid negative rule",
+        apply: () => ({
+          discount: -500,
+          explanation: "Should be clamped to zero"
+        })
+      }
+    ]);
+
+    expect(discountCart.subtotal).toBe(6150);
+    expect(discountCart.items[0]?.qty).toBe(3);
+    expect(pricing.subtotalPence).toBe(6150);
+    expect(pricing.totalDiscountPence).toBe(375);
+    expect(pricing.finalTotalPence).toBe(5775);
+    expect(pricing.discounts).toHaveLength(1);
+    expect(isGeneratedRulePath("src/lib/discounts/generated/example.v1.ts")).toBe(
+      true
+    );
+    expect(isGeneratedRulePath("../outside.ts")).toBe(false);
+  });
+});
+
+function createTeaDiscountSources(
+  slug: string,
+  version: number
+): GeneratedRuleSources {
+  return {
+    moduleCode: `import type { Cart, DiscountResult } from "../contract";
+
+export function describe(): string {
+  return "10% off tea baskets over £30";
+}
+
+export function apply(cart: Cart): DiscountResult {
+  const hasTea = cart.items.some((item) =>
+    [item.sku, item.name, item.category].some((value) =>
+      value.toLowerCase().includes("tea")
+    )
+  );
+
+  if (!hasTea || cart.subtotal <= 3000) {
+    return { discount: 0, explanation: "Tea discount did not apply." };
+  }
+
+  const discount = Math.min(Math.floor(cart.subtotal / 10), cart.subtotal);
+  return { discount, explanation: "10% tea discount applied." };
+}
+`,
+    testCode: `import { describe, expect, it } from "vitest";
+import { apply, describe as describeRule } from "./${slug}.v${version}";
+
+describe("10% off tea over £30", () => {
+  it("applies to a catalogue-shaped tea cart over £30", () => {
+    const result = apply({
+      items: [
+        {
+          sku: "TEA-BLK-003",
+          name: "Breakfast Tea Tin",
+          category: "pantry",
+          qty: 3,
+          unitPrice: 1250
+        }
+      ],
+      subtotal: 3750,
+      placedAt: "2026-06-06T12:00:00.000Z"
+    });
+
+    expect(describeRule()).toBe("10% off tea baskets over £30");
+    expect(result.discount).toBe(375);
+  });
+
+  it("does not apply to non-matching or empty carts", () => {
+    expect(apply({
+      items: [
+        {
+          sku: "BAG-CNV-002",
+          name: "Canvas Market Tote",
+          category: "bags",
+          qty: 1,
+          unitPrice: 2400
+        }
+      ],
+      subtotal: 2400,
+      placedAt: "2026-06-06T12:00:00.000Z"
+    }).discount).toBe(0);
+    expect(apply({
+      items: [],
+      subtotal: 0,
+      placedAt: "2026-06-06T12:00:00.000Z"
+    }).discount).toBe(0);
+  });
+});
+`
+  };
+}
+
+function createNegativeDiscountSources(
+  slug: string,
+  version: number
+): GeneratedRuleSources {
+  return {
+    moduleCode: `import type { Cart, DiscountResult } from "../contract";
+
+export function describe(): string {
+  return "Risky tea discount";
+}
+
+export function apply(cart: Cart): DiscountResult {
+  const discount = cart.items.length > 0 ? -100 : 0;
+  return { discount, explanation: "Unsafe discount." };
+}
+`,
+    testCode: `import { describe, expect, it } from "vitest";
+import { apply } from "./${slug}.v${version}";
+
+describe("risky discount", () => {
+  it("matches the generated test intent", () => {
+    expect(apply({
+      items: [],
+      subtotal: 0,
+      placedAt: "2026-06-06T12:00:00.000Z"
+    }).discount).toBe(0);
+  });
+});
+`
+  };
+}
