@@ -343,6 +343,10 @@ export function validateGeneratedTestSource(
 
   for (const statement of sourceFile.statements) {
     if (ts.isImportDeclaration(statement)) {
+      if (isAllowedGeneratedTestTypeImport(statement)) {
+        continue;
+      }
+
       validateImportDeclaration(statement, {
         allowedModules,
         requireTypeOnly: false
@@ -793,6 +797,16 @@ function validateImportDeclaration(
   }
 }
 
+function isAllowedGeneratedTestTypeImport(
+  statement: ts.ImportDeclaration
+): boolean {
+  return (
+    ts.isStringLiteral(statement.moduleSpecifier) &&
+    statement.moduleSpecifier.text === "../contract" &&
+    statement.importClause?.isTypeOnly === true
+  );
+}
+
 function validateForbiddenSyntax(sourceFile: ts.SourceFile): void {
   const forbiddenIdentifiers = new Set([
     "require",
@@ -831,7 +845,14 @@ function validateForbiddenSyntax(sourceFile: ts.SourceFile): void {
     }
 
     if (ts.isNewExpression(node) && ts.isIdentifier(node.expression)) {
-      if (node.expression.text === "Date" || node.expression.text === "Function") {
+      if (
+        node.expression.text === "Date" &&
+        !isDeterministicDateConstruction(node)
+      ) {
+        throw new Error("Generated source uses a forbidden API.");
+      }
+
+      if (node.expression.text === "Function") {
         throw new Error("Generated source uses a forbidden API.");
       }
     }
@@ -853,6 +874,27 @@ function validateForbiddenSyntax(sourceFile: ts.SourceFile): void {
   };
 
   ts.forEachChild(sourceFile, visit);
+}
+
+function isDeterministicDateConstruction(node: ts.NewExpression): boolean {
+  if (
+    node.arguments?.length === 1 &&
+    ts.isPropertyAccessExpression(node.arguments[0]) &&
+    node.arguments[0].name.text === "placedAt" &&
+    ts.isIdentifier(node.arguments[0].expression) &&
+    node.arguments[0].expression.text === "cart"
+  ) {
+    return true;
+  }
+
+  return (
+    node.arguments?.length === 1 &&
+    ts.isCallExpression(node.arguments[0]) &&
+    ts.isPropertyAccessExpression(node.arguments[0].expression) &&
+    ts.isIdentifier(node.arguments[0].expression.expression) &&
+    node.arguments[0].expression.expression.text === "Date" &&
+    node.arguments[0].expression.name.text === "UTC"
+  );
 }
 
 function hasExportModifier(node: ts.Node): boolean {

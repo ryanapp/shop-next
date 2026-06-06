@@ -283,6 +283,62 @@ describe("bad", () => {
 `, "./tea.v1")
     ).toThrow("forbidden module");
   });
+
+  it("allows deterministic date parsing and test type imports from the contract", () => {
+    expect(() =>
+      validateGeneratedModuleSource(`import type { Cart, DiscountResult } from "../contract";
+
+const SATURDAY = 6;
+
+export function describe(): string {
+  return "£5 off carts placed on Saturdays";
+}
+
+function dayOfWeekFromIsoDate(placedAt: string): number | null {
+  const match = /^(\\d{4})-(\\d{2})-(\\d{2})/.exec(placedAt);
+  if (!match) {
+    return null;
+  }
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const date = new Date(Date.UTC(year, month - 1, day));
+
+  return date.getUTCDay();
+}
+
+export function apply(cart: Cart): DiscountResult {
+  return {
+    discount: dayOfWeekFromIsoDate(cart.placedAt) === SATURDAY ? 500 : 0,
+    explanation: "Saturday discount."
+  };
+}
+`)
+    ).not.toThrow();
+
+    expect(() =>
+      validateGeneratedTestSource(`import { describe, expect, it } from "vitest";
+import type { Cart } from "../contract";
+import { apply } from "./give-a-5-discount-on-saturdays.v3";
+
+function cart(overrides: Partial<Cart> = {}): Cart {
+  return {
+    items: [],
+    subtotal: 0,
+    placedAt: "2026-06-06T10:30:00.000Z",
+    ...overrides
+  };
+}
+
+describe("Saturday discount", () => {
+  it("applies on Saturday", () => {
+    expect(apply(cart()).discount).toBe(500);
+  });
+});
+`, "./give-a-5-discount-on-saturdays.v3")
+    ).not.toThrow();
+  });
 });
 
 function createTeaDiscountSources(
