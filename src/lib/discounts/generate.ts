@@ -48,6 +48,8 @@ type VerificationResults = {
   app?: TestRunResult;
 };
 
+type StatusUpdater = (event: GenerationEvent) => void;
+
 export type GenerationEvent =
   | {
       type: "phase";
@@ -127,12 +129,7 @@ export async function generateDiscountRule(
   );
 
   try {
-    updateStatus({
-      type: "phase",
-      phase: "POLICY_REVIEW",
-      message: "Reviewing merchant prompt against discount policy."
-    });
-    const promptReview = await reviewDiscountPolicy(trimmedPrompt);
+    const promptReview = await reviewPromptPolicy(trimmedPrompt, updateStatus);
 
     if (!promptReview.accepted) {
       const result = await failRule(prisma, rule.id, promptReview.reason);
@@ -140,31 +137,21 @@ export async function generateDiscountRule(
       return result;
     }
 
-    updateStatus({
-      type: "phase",
-      phase: "GENERATING",
-      message: "Generating discount module and Vitest spec with Codex."
-    });
-    const createSources = options.createSources ?? createSourcesWithCodex;
-    const generated = await createSources({
+    const generated = await generateRuleSources({
       prompt: trimmedPrompt,
       slug,
       version,
       modulePath,
       testPath,
-      onCodexOutput: (text) => updateStatus({ type: "codex", text })
+      createSources: options.createSources,
+      updateStatus
     });
 
-    validateGeneratedModuleSource(generated.moduleCode);
-
-    updateStatus({
-      type: "phase",
-      phase: "SOURCE_REVIEW",
-      message: "Validating generated source and reviewing it against policy."
+    const sourceReview = await reviewGeneratedSources({
+      prompt: trimmedPrompt,
+      generated,
+      updateStatus
     });
-    const sourceReview = await reviewDiscountPolicy(
-      `${trimmedPrompt}\n\n${generated.moduleCode}\n\n${generated.testCode}`
-    );
 
     if (!sourceReview.accepted) {
       const result = await failRule(prisma, rule.id, sourceReview.reason);
@@ -172,36 +159,21 @@ export async function generateDiscountRule(
       return result;
     }
 
-    const moduleImportPath = `./${slug}.v${version}`;
-    const augmentedTestCode = appendSystemSafetyTest(
-      generated.testCode,
-      moduleImportPath
-    );
-    validateGeneratedTestSource(augmentedTestCode, moduleImportPath);
-
-    await mkdir(path.join(process.cwd(), generatedDirectory), {
-      recursive: true
-    });
-    await writeFile(path.join(process.cwd(), modulePath), generated.moduleCode);
-    await writeFile(path.join(process.cwd(), testPath), augmentedTestCode);
-
-    await prisma.rule.update({
-      where: { id: rule.id },
-      data: {
-        status: RULE_STATUSES.TESTING,
-        moduleCode: generated.moduleCode,
-        testCode: augmentedTestCode
-      }
+    await persistGeneratedSources({
+      prisma,
+      ruleId: rule.id,
+      slug,
+      version,
+      modulePath,
+      testPath,
+      generated
     });
 
-    const runTests = options.runTests ?? runVitestForGeneratedRule;
-    updateStatus({
-      type: "phase",
-      phase: "TESTING",
-      message: "Running generated Vitest spec and system-owned safety tests."
+    const generatedTestResults = await runGeneratedRuleTests({
+      testPath,
+      runTests: options.runTests,
+      updateStatus
     });
-    const generatedTestResults = await runTests(testPath);
-    updateStatus({ type: "generatedTestResults", results: generatedTestResults });
 
     if (generatedTestResults.exitCode !== 0) {
       return await failVerifiedRule(prisma, rule.id, updateStatus, {
@@ -209,26 +181,9 @@ export async function generateDiscountRule(
       });
     }
 
-    updateStatus({
-      type: "phase",
-      phase: "APP_TESTING",
-      message: "Running built-in app test suite before activation."
-    });
-    updateStatus({
-      type: "appTestStatus",
-      status: "RUNNING",
-      message: "Running built-in app test suite."
-    });
-    const runAppTests = options.runAppTests ?? runBuiltInAppTests;
-    const appTestResults = await runAppTests();
-    updateStatus({
-      type: "appTestStatus",
-      status: appTestResults.exitCode === 0 ? "PASSED" : "FAILED",
-      message:
-        appTestResults.exitCode === 0
-          ? "Built-in app tests passed."
-          : "Built-in app tests failed.",
-      results: appTestResults
+    const appTestResults = await runAppVerificationTests({
+      runAppTests: options.runAppTests,
+      updateStatus
     });
 
     if (appTestResults.exitCode !== 0) {
@@ -238,48 +193,14 @@ export async function generateDiscountRule(
       });
     }
 
-    updateStatus({
-      type: "phase",
-      phase: "ACTIVATING",
-      message: "Activating verified rule and disabling older active versions."
-    });
-    const combinedResults = serializeVerificationResults({
+    return await activateVerifiedRule({
+      prisma,
+      ruleId: rule.id,
+      slug,
       generated: generatedTestResults,
-      app: appTestResults
+      app: appTestResults,
+      updateStatus
     });
-    await prisma.$transaction([
-      prisma.rule.updateMany({
-        where: {
-          slug,
-          id: { not: rule.id },
-          status: RULE_STATUSES.ACTIVE
-        },
-        data: { status: RULE_STATUSES.DISABLED }
-      }),
-      prisma.rule.update({
-        where: { id: rule.id },
-        data: {
-          status: RULE_STATUSES.ACTIVE,
-          generatedTestResults: JSON.stringify(generatedTestResults, null, 2),
-          appTestResults: JSON.stringify(appTestResults, null, 2),
-          testResults: combinedResults
-        }
-      })
-    ]);
-
-    const result = {
-      id: rule.id,
-      status: RULE_STATUSES.ACTIVE,
-      accepted: true,
-      testResults: combinedResults
-    };
-    updateStatus({
-      type: "phase",
-      phase: "ACTIVE",
-      message: "Generated rule passed verification and is active."
-    });
-    updateStatus({ type: "result", result });
-    return result;
   } catch (error) {
     const result = await failRule(
       prisma,
@@ -289,6 +210,204 @@ export async function generateDiscountRule(
     updateStatus({ type: "result", result });
     return result;
   }
+}
+
+async function reviewPromptPolicy(
+  prompt: string,
+  updateStatus: StatusUpdater
+): Promise<{ accepted: boolean; reason: string }> {
+  updateStatus({
+    type: "phase",
+    phase: "POLICY_REVIEW",
+    message: "Reviewing merchant prompt against discount policy."
+  });
+
+  return await reviewDiscountPolicy(prompt);
+}
+
+async function generateRuleSources(input: {
+  prompt: string;
+  slug: string;
+  version: number;
+  modulePath: string;
+  testPath: string;
+  createSources?: GenerateRuleOptions["createSources"];
+  updateStatus: StatusUpdater;
+}): Promise<GeneratedRuleSources> {
+  input.updateStatus({
+    type: "phase",
+    phase: "GENERATING",
+    message: "Generating discount module and Vitest spec with Codex."
+  });
+
+  const createSources = input.createSources ?? createSourcesWithCodex;
+
+  return await createSources({
+    prompt: input.prompt,
+    slug: input.slug,
+    version: input.version,
+    modulePath: input.modulePath,
+    testPath: input.testPath,
+    onCodexOutput: (text) => input.updateStatus({ type: "codex", text })
+  });
+}
+
+async function reviewGeneratedSources(input: {
+  prompt: string;
+  generated: GeneratedRuleSources;
+  updateStatus: StatusUpdater;
+}): Promise<{ accepted: boolean; reason: string }> {
+  validateGeneratedModuleSource(input.generated.moduleCode);
+
+  input.updateStatus({
+    type: "phase",
+    phase: "SOURCE_REVIEW",
+    message: "Validating generated source and reviewing it against policy."
+  });
+
+  const sourceReview = await reviewDiscountPolicy(
+    `${input.prompt}\n\n${input.generated.moduleCode}\n\n${input.generated.testCode}`
+  );
+
+  return sourceReview;
+}
+
+async function persistGeneratedSources(input: {
+  prisma: PrismaClient;
+  ruleId: string;
+  slug: string;
+  version: number;
+  modulePath: string;
+  testPath: string;
+  generated: GeneratedRuleSources;
+}): Promise<void> {
+  const moduleImportPath = `./${input.slug}.v${input.version}`;
+  const augmentedTestCode = appendSystemSafetyTest(
+    input.generated.testCode,
+    moduleImportPath
+  );
+  validateGeneratedTestSource(augmentedTestCode, moduleImportPath);
+
+  await mkdir(path.join(process.cwd(), generatedDirectory), {
+    recursive: true
+  });
+  await writeFile(path.join(process.cwd(), input.modulePath), input.generated.moduleCode);
+  await writeFile(path.join(process.cwd(), input.testPath), augmentedTestCode);
+
+  await input.prisma.rule.update({
+    where: { id: input.ruleId },
+    data: {
+      status: RULE_STATUSES.TESTING,
+      moduleCode: input.generated.moduleCode,
+      testCode: augmentedTestCode
+    }
+  });
+}
+
+async function runGeneratedRuleTests(input: {
+  testPath: string;
+  runTests?: GenerateRuleOptions["runTests"];
+  updateStatus: StatusUpdater;
+}): Promise<TestRunResult> {
+  const runTests = input.runTests ?? runVitestForGeneratedRule;
+
+  input.updateStatus({
+    type: "phase",
+    phase: "TESTING",
+    message: "Running generated Vitest spec and system-owned safety tests."
+  });
+
+  const results = await runTests(input.testPath);
+  input.updateStatus({ type: "generatedTestResults", results });
+
+  return results;
+}
+
+async function runAppVerificationTests(input: {
+  runAppTests?: GenerateRuleOptions["runAppTests"];
+  updateStatus: StatusUpdater;
+}): Promise<TestRunResult> {
+  input.updateStatus({
+    type: "phase",
+    phase: "APP_TESTING",
+    message: "Running built-in app test suite before activation."
+  });
+  input.updateStatus({
+    type: "appTestStatus",
+    status: "RUNNING",
+    message: "Running built-in app test suite."
+  });
+
+  const runAppTests = input.runAppTests ?? runBuiltInAppTests;
+  const results = await runAppTests();
+
+  input.updateStatus({
+    type: "appTestStatus",
+    status: results.exitCode === 0 ? "PASSED" : "FAILED",
+    message:
+      results.exitCode === 0
+        ? "Built-in app tests passed."
+        : "Built-in app tests failed.",
+    results
+  });
+
+  return results;
+}
+
+async function activateVerifiedRule(input: {
+  prisma: PrismaClient;
+  ruleId: string;
+  slug: string;
+  generated: TestRunResult;
+  app: TestRunResult;
+  updateStatus: StatusUpdater;
+}): Promise<RuleGenerationResult> {
+  input.updateStatus({
+    type: "phase",
+    phase: "ACTIVATING",
+    message: "Activating verified rule and disabling older active versions."
+  });
+
+  const combinedResults = serializeVerificationResults({
+    generated: input.generated,
+    app: input.app
+  });
+
+  await input.prisma.$transaction([
+    input.prisma.rule.updateMany({
+      where: {
+        slug: input.slug,
+        id: { not: input.ruleId },
+        status: RULE_STATUSES.ACTIVE
+      },
+      data: { status: RULE_STATUSES.DISABLED }
+    }),
+    input.prisma.rule.update({
+      where: { id: input.ruleId },
+      data: {
+        status: RULE_STATUSES.ACTIVE,
+        generatedTestResults: JSON.stringify(input.generated, null, 2),
+        appTestResults: JSON.stringify(input.app, null, 2),
+        testResults: combinedResults
+      }
+    })
+  ]);
+
+  const result = {
+    id: input.ruleId,
+    status: RULE_STATUSES.ACTIVE,
+    accepted: true,
+    testResults: combinedResults
+  };
+
+  input.updateStatus({
+    type: "phase",
+    phase: "ACTIVE",
+    message: "Generated rule passed verification and is active."
+  });
+  input.updateStatus({ type: "result", result });
+
+  return result;
 }
 
 export function slugify(value: string): string {
