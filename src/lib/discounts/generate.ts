@@ -118,7 +118,7 @@ export async function generateDiscountRule(
   }
 
   const prisma = options.prisma ?? defaultPrisma;
-  const emit = options.onEvent ?? (() => undefined);
+  const updateStatus = options.onEvent ?? (() => undefined);
   const slug = options.slug ?? slugify(trimmedPrompt);
   const { rule, version, modulePath, testPath } = await createGeneratingRule(
     prisma,
@@ -127,7 +127,7 @@ export async function generateDiscountRule(
   );
 
   try {
-    emit({
+    updateStatus({
       type: "phase",
       phase: "POLICY_REVIEW",
       message: "Reviewing merchant prompt against discount policy."
@@ -136,11 +136,11 @@ export async function generateDiscountRule(
 
     if (!promptReview.accepted) {
       const result = await failRule(prisma, rule.id, promptReview.reason);
-      emit({ type: "result", result });
+      updateStatus({ type: "result", result });
       return result;
     }
 
-    emit({
+    updateStatus({
       type: "phase",
       phase: "GENERATING",
       message: "Generating discount module and Vitest spec with Codex."
@@ -152,12 +152,12 @@ export async function generateDiscountRule(
       version,
       modulePath,
       testPath,
-      onCodexOutput: (text) => emit({ type: "codex", text })
+      onCodexOutput: (text) => updateStatus({ type: "codex", text })
     });
 
     validateGeneratedModuleSource(generated.moduleCode);
 
-    emit({
+    updateStatus({
       type: "phase",
       phase: "SOURCE_REVIEW",
       message: "Validating generated source and reviewing it against policy."
@@ -168,7 +168,7 @@ export async function generateDiscountRule(
 
     if (!sourceReview.accepted) {
       const result = await failRule(prisma, rule.id, sourceReview.reason);
-      emit({ type: "result", result });
+      updateStatus({ type: "result", result });
       return result;
     }
 
@@ -195,33 +195,33 @@ export async function generateDiscountRule(
     });
 
     const runTests = options.runTests ?? runVitestForGeneratedRule;
-    emit({
+    updateStatus({
       type: "phase",
       phase: "TESTING",
       message: "Running generated Vitest spec and system-owned safety tests."
     });
     const generatedTestResults = await runTests(testPath);
-    emit({ type: "generatedTestResults", results: generatedTestResults });
+    updateStatus({ type: "generatedTestResults", results: generatedTestResults });
 
     if (generatedTestResults.exitCode !== 0) {
-      return await failVerifiedRule(prisma, rule.id, emit, {
+      return await failVerifiedRule(prisma, rule.id, updateStatus, {
         generated: generatedTestResults
       });
     }
 
-    emit({
+    updateStatus({
       type: "phase",
       phase: "APP_TESTING",
       message: "Running built-in app test suite before activation."
     });
-    emit({
+    updateStatus({
       type: "appTestStatus",
       status: "RUNNING",
       message: "Running built-in app test suite."
     });
     const runAppTests = options.runAppTests ?? runBuiltInAppTests;
     const appTestResults = await runAppTests();
-    emit({
+    updateStatus({
       type: "appTestStatus",
       status: appTestResults.exitCode === 0 ? "PASSED" : "FAILED",
       message:
@@ -232,13 +232,13 @@ export async function generateDiscountRule(
     });
 
     if (appTestResults.exitCode !== 0) {
-      return await failVerifiedRule(prisma, rule.id, emit, {
+      return await failVerifiedRule(prisma, rule.id, updateStatus, {
         generated: generatedTestResults,
         app: appTestResults
       });
     }
 
-    emit({
+    updateStatus({
       type: "phase",
       phase: "ACTIVATING",
       message: "Activating verified rule and disabling older active versions."
@@ -273,12 +273,12 @@ export async function generateDiscountRule(
       accepted: true,
       testResults: combinedResults
     };
-    emit({
+    updateStatus({
       type: "phase",
       phase: "ACTIVE",
       message: "Generated rule passed verification and is active."
     });
-    emit({ type: "result", result });
+    updateStatus({ type: "result", result });
     return result;
   } catch (error) {
     const result = await failRule(
@@ -286,7 +286,7 @@ export async function generateDiscountRule(
       rule.id,
       error instanceof Error ? error.message : "Rule generation failed."
     );
-    emit({ type: "result", result });
+    updateStatus({ type: "result", result });
     return result;
   }
 }
@@ -655,7 +655,7 @@ async function reviewDiscountPolicy(
 async function failVerifiedRule(
   prisma: PrismaClient,
   id: string,
-  emit: (event: GenerationEvent) => void,
+  updateStatus: (event: GenerationEvent) => void,
   results: VerificationResults
 ): Promise<RuleGenerationResult> {
   const testResults = serializeVerificationResults(results);
@@ -678,12 +678,12 @@ async function failVerifiedRule(
     accepted: false,
     testResults
   };
-  emit({
+  updateStatus({
     type: "phase",
     phase: "FAILED",
     message: "Generated rule failed verification."
   });
-  emit({ type: "result", result });
+  updateStatus({ type: "result", result });
   return result;
 }
 
