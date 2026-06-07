@@ -187,6 +187,14 @@ function isDeterministicDateConstruction(node: ts.NewExpression): boolean {
     return true;
   }
 
+  if (
+    node.arguments?.length === 1 &&
+    ts.isIdentifier(node.arguments[0]) &&
+    node.arguments[0].text === "placedAt"
+  ) {
+    return true;
+  }
+
   return (
     node.arguments?.length === 1 &&
     ts.isCallExpression(node.arguments[0]) &&

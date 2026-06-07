@@ -343,6 +343,37 @@ describe("Saturday discount", () => {
 `, "./give-a-5-discount-on-saturdays.v3")
     ).not.toThrow();
   });
+
+  it("allows helper functions to parse a placedAt argument deterministically", () => {
+    expect(() =>
+      validateGeneratedModuleSource(`import type { Cart, DiscountResult } from "../contract";
+
+function isSundayAfternoonWindow(placedAt: string): boolean {
+  const placedDate = new Date(placedAt);
+
+  if (Number.isNaN(placedDate.getTime())) {
+    return false;
+  }
+
+  const day = placedDate.getUTCDay();
+  const hour = placedDate.getUTCHours();
+
+  return day === 0 && hour >= 16 && hour < 19;
+}
+
+export function describe(): string {
+  return "10% off tea on Sundays between 4pm and 7pm";
+}
+
+export function apply(cart: Cart): DiscountResult {
+  return {
+    discount: isSundayAfternoonWindow(cart.placedAt) ? 100 : 0,
+    explanation: "Sunday tea discount."
+  };
+}
+`)
+    ).not.toThrow();
+  });
 });
 
 function createTeaDiscountSources(
