@@ -8,6 +8,7 @@ import { buildCartSummary } from "../src/lib/cart";
 import { cartSummaryToDiscountCart } from "../src/lib/discounts/adapter";
 import {
   createCodexChildEnv,
+  createCodexThreadOptions,
   sanitizeCodexChildPath
 } from "../src/lib/discounts/codex-source-generator";
 import {
@@ -173,6 +174,12 @@ describe("Codex SDK runtime environment", () => {
     );
 
     expect(sanitized).toBe("/usr/local/bin:/usr/bin");
+  });
+
+  it("allows rule generation from a downloaded source archive", () => {
+    expect(createCodexThreadOptions()).toMatchObject({
+      skipGitRepoCheck: true
+    });
   });
 });
 

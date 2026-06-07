@@ -32,12 +32,7 @@ export async function createSourcesWithCodex(input: {
   const codex = new Codex({
     env: createCodexChildEnv()
   });
-  const thread = codex.startThread({
-    workingDirectory: process.cwd(),
-    sandboxMode: "read-only",
-    approvalPolicy: "never",
-    networkAccessEnabled: false
-  });
+  const thread = codex.startThread(createCodexThreadOptions());
 
   const prompt = `Generate a discount module and Vitest spec as JSON only.
 
@@ -110,6 +105,16 @@ export function createCodexChildEnv(): Record<string, string> {
   }
 
   return env;
+}
+
+export function createCodexThreadOptions() {
+  return {
+    workingDirectory: process.cwd(),
+    sandboxMode: "read-only" as const,
+    approvalPolicy: "never" as const,
+    networkAccessEnabled: false,
+    skipGitRepoCheck: true
+  };
 }
 
 export function sanitizeCodexChildPath(value: string): string {
