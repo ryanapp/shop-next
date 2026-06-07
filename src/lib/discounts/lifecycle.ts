@@ -5,6 +5,7 @@ import { revalidatePath } from "next/cache";
 import { prisma as defaultPrisma } from "../db";
 import { generateDiscountRule, type GenerateRuleOptions } from "./generate";
 import { isGeneratedRulePath } from "./loader";
+import { activateRuleVersion } from "./rule-store";
 import { RULE_STATUSES } from "./status";
 
 export type LifecycleOptions = {
@@ -37,20 +38,11 @@ export async function activateRule(
     throw new Error("Only verified generated rules can be activated.");
   }
 
-  await prisma.$transaction([
-    prisma.rule.updateMany({
-      where: {
-        slug: rule.slug,
-        id: { not: rule.id },
-        status: RULE_STATUSES.ACTIVE
-      },
-      data: { status: RULE_STATUSES.DISABLED }
-    }),
-    prisma.rule.update({
-      where: { id },
-      data: { status: RULE_STATUSES.ACTIVE }
-    })
-  ]);
+  await activateRuleVersion({
+    prisma,
+    ruleId: id,
+    slug: rule.slug
+  });
 
   revalidateRuleViews(options);
   return await prisma.rule.findUniqueOrThrow({ where: { id } });

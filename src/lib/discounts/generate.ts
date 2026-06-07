@@ -16,10 +16,16 @@ import type { PrismaClient } from "@prisma/client";
 import ts from "typescript";
 import { prisma as defaultPrisma } from "../db";
 import { runBuiltInAppTests } from "../verification/app-tests";
+import {
+  activateRuleVersion,
+  generatedRuleDirectory,
+  markRuleFailed,
+  markRuleTesting,
+  reserveGeneratingRule
+} from "./rule-store";
 import { RULE_STATUSES } from "./status";
 
 const execFileAsync = promisify(execFile);
-const generatedDirectory = "src/lib/discounts/generated";
 const skillPath = ".agents/skills/discount-rule/SKILL.md";
 const policyPath = ".agents/skills/discount-rule/references/policy.md";
 
@@ -122,7 +128,7 @@ export async function generateDiscountRule(
   const prisma = options.prisma ?? defaultPrisma;
   const updateStatus = options.onEvent ?? (() => undefined);
   const slug = options.slug ?? slugify(trimmedPrompt);
-  const { rule, version, modulePath, testPath } = await createGeneratingRule(
+  const { rule, version, modulePath, testPath } = await reserveGeneratingRule(
     prisma,
     slug,
     trimmedPrompt
@@ -288,19 +294,17 @@ async function persistGeneratedSources(input: {
   );
   validateGeneratedTestSource(augmentedTestCode, moduleImportPath);
 
-  await mkdir(path.join(process.cwd(), generatedDirectory), {
+  await mkdir(path.join(process.cwd(), generatedRuleDirectory), {
     recursive: true
   });
   await writeFile(path.join(process.cwd(), input.modulePath), input.generated.moduleCode);
   await writeFile(path.join(process.cwd(), input.testPath), augmentedTestCode);
 
-  await input.prisma.rule.update({
-    where: { id: input.ruleId },
-    data: {
-      status: RULE_STATUSES.TESTING,
-      moduleCode: input.generated.moduleCode,
-      testCode: augmentedTestCode
-    }
+  await markRuleTesting({
+    prisma: input.prisma,
+    ruleId: input.ruleId,
+    moduleCode: input.generated.moduleCode,
+    testCode: augmentedTestCode
   });
 }
 
@@ -373,25 +377,14 @@ async function activateVerifiedRule(input: {
     app: input.app
   });
 
-  await input.prisma.$transaction([
-    input.prisma.rule.updateMany({
-      where: {
-        slug: input.slug,
-        id: { not: input.ruleId },
-        status: RULE_STATUSES.ACTIVE
-      },
-      data: { status: RULE_STATUSES.DISABLED }
-    }),
-    input.prisma.rule.update({
-      where: { id: input.ruleId },
-      data: {
-        status: RULE_STATUSES.ACTIVE,
-        generatedTestResults: JSON.stringify(input.generated, null, 2),
-        appTestResults: JSON.stringify(input.app, null, 2),
-        testResults: combinedResults
-      }
-    })
-  ]);
+  await activateRuleVersion({
+    prisma: input.prisma,
+    ruleId: input.ruleId,
+    slug: input.slug,
+    generatedTestResults: JSON.stringify(input.generated, null, 2),
+    appTestResults: JSON.stringify(input.app, null, 2),
+    testResults: combinedResults
+  });
 
   const result = {
     id: input.ruleId,
@@ -779,16 +772,14 @@ async function failVerifiedRule(
 ): Promise<RuleGenerationResult> {
   const testResults = serializeVerificationResults(results);
 
-  await prisma.rule.update({
-    where: { id },
-    data: {
-      status: RULE_STATUSES.FAILED,
-      generatedTestResults: results.generated
-        ? JSON.stringify(results.generated, null, 2)
-        : undefined,
-      appTestResults: results.app ? JSON.stringify(results.app, null, 2) : undefined,
-      testResults
-    }
+  await markRuleFailed({
+    prisma,
+    ruleId: id,
+    generatedTestResults: results.generated
+      ? JSON.stringify(results.generated, null, 2)
+      : undefined,
+    appTestResults: results.app ? JSON.stringify(results.app, null, 2) : undefined,
+    testResults
   });
 
   const result = {
@@ -823,12 +814,10 @@ async function failRule(
     2
   );
 
-  await prisma.rule.update({
-    where: { id },
-    data: {
-      status: RULE_STATUSES.FAILED,
-      testResults
-    }
+  await markRuleFailed({
+    prisma,
+    ruleId: id,
+    testResults
   });
 
   return {
@@ -837,41 +826,6 @@ async function failRule(
     accepted: false,
     testResults
   };
-}
-
-async function createGeneratingRule(
-  prisma: PrismaClient,
-  slug: string,
-  source: string
-) {
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    const version = await nextVersionForSlug(prisma, slug);
-    const modulePath = `${generatedDirectory}/${slug}.v${version}.ts`;
-    const testPath = `${generatedDirectory}/${slug}.v${version}.test.ts`;
-
-    try {
-      const rule = await prisma.rule.create({
-        data: {
-          source,
-          slug,
-          version,
-          status: RULE_STATUSES.GENERATING,
-          modulePath,
-          testPath
-        }
-      });
-
-      return { rule, version, modulePath, testPath };
-    } catch (error) {
-      if (isUniqueConstraintError(error)) {
-        continue;
-      }
-
-      throw error;
-    }
-  }
-
-  throw new Error("Could not reserve a unique generated rule version.");
 }
 
 function parseSource(filename: string, source: string): ts.SourceFile {
@@ -1027,26 +981,4 @@ function hasExportModifier(node: ts.Node): boolean {
 
 function serializeVerificationResults(results: VerificationResults): string {
   return JSON.stringify(results, null, 2);
-}
-
-function isUniqueConstraintError(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    error.code === "P2002"
-  );
-}
-
-async function nextVersionForSlug(
-  prisma: PrismaClient,
-  slug: string
-): Promise<number> {
-  const latest = await prisma.rule.findFirst({
-    where: { slug },
-    orderBy: { version: "desc" },
-    select: { version: true }
-  });
-
-  return (latest?.version ?? 0) + 1;
 }
