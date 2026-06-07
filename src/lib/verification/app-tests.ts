@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { TestRunResult } from "../discounts/generate";
+import type { TestRunResult } from "../discounts/generation-types";
 
 const execFileAsync = promisify(execFile);
 

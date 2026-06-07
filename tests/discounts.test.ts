@@ -8,12 +8,16 @@ import { buildCartSummary } from "../src/lib/cart";
 import { cartSummaryToDiscountCart } from "../src/lib/discounts/adapter";
 import {
   createCodexChildEnv,
+  sanitizeCodexChildPath
+} from "../src/lib/discounts/codex-source-generator";
+import {
   generateDiscountRule,
-  sanitizeCodexChildPath,
-  validateGeneratedModuleSource,
-  validateGeneratedTestSource,
   type GeneratedRuleSources
 } from "../src/lib/discounts/generate";
+import {
+  validateGeneratedModuleSource,
+  validateGeneratedTestSource
+} from "../src/lib/discounts/generated-source-validation";
 import { priceCartWithRules } from "../src/lib/discounts/engine";
 import { formatStorePlacedAt } from "../src/lib/discounts/pricing";
 import { RULE_STATUSES } from "../src/lib/discounts/status";
